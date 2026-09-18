@@ -121,6 +121,8 @@ jobs:
       - name: Detect .deb runtime dependencies via dpkg-shlibdeps
         id: shlibdeps
         run: |
+          mkdir -p debian
+          touch debian/control
           dpkg-shlibdeps -O staging/usr/bin/quran-companion > shlibdeps.raw 2>shlibdeps.log || true
           cat shlibdeps.log
           DEPS=$(sed -n 's/^shlibs:Depends=//p' shlibdeps.raw | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
