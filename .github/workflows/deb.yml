@@ -1,0 +1,158 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      test_version:
+        description: "Version to use for this test run"
+        required: true
+        default: "0.0.2-test"
+  push:
+    tags:
+      - "v*.*.*"
+concurrency:
+  group: "${{ github.workflow }}"
+  cancel-in-progress: true
+env:
+  BUILD_TYPE: Release
+  QT_INSTALL_VERSION: 6.10.2
+  QT_INSTALL_MODULES: >-
+    qtimageformats
+    qtmultimedia
+    qtnetworkauth
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: "${{ steps.setversion.outputs.version }}"
+    steps:
+      - name: Checkout VERSION
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          sparse-checkout: VERSION
+          sparse-checkout-cone-mode: false
+
+      - name: Set environmental variables
+        run: |
+          echo "RELEASE_VERSION=$(cat "${{ github.workspace }}/VERSION")" >> "$GITHUB_ENV"
+          echo "MAIN_SHA=$(git rev-parse --verify main)" >> "$GITHUB_ENV"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "TAG_VERSION=${{ inputs.test_version }}" >> "$GITHUB_ENV"
+          else
+            echo "TAG_VERSION=$(echo "${{ github.ref_name }}" | cut -d'v' -f2)" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check release version and commit sha
+        if: github.event_name == 'push'
+        run: |
+          echo "::group::Check tag commit matches latest commit on main"
+          if [[ "$GITHUB_SHA" != "$MAIN_SHA" ]]; then
+            echo "::error title=Commit mismatch::Latest commit on main ($MAIN_SHA) does not match tag commit ($GITHUB_SHA)"
+            exit 1
+          fi
+          echo "::endgroup::"
+          echo "::group::Check release version matches tag"
+          if [[ "$RELEASE_VERSION" != "$TAG_VERSION" ]]; then
+            echo "::error title=Version mismatch::Release version ($RELEASE_VERSION) does not match tag version ($TAG_VERSION)"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: Set application version
+        id: setversion
+        run: echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+  
+  build-packages-matrix:
+    needs:
+      - prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            qc_arch: linux_gcc_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            qc_arch: linux_gcc_arm64
+
+    runs-on: ${{ matrix.runner }}
+    env:
+      APP_VER: "${{ needs.prepare.outputs.version }}"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          submodules: true
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v3
+        with:
+          cache: true
+          host: linux
+          target: desktop
+          arch: ${{ matrix.qc_arch }}
+          version: "${{ env.QT_INSTALL_VERSION }}"
+          modules: "${{ env.QT_INSTALL_MODULES }}"
+
+      - name: Install build + packaging tools
+        run: |
+          sudo apt update -y
+          sudo apt install -y build-essential cmake ninja-build libxcb-cursor0 ffmpeg dpkg-dev
+          sudo gem install --no-document fpm
+
+      - name: Stage metadata & assets
+        run: |
+          mkdir -p staging/usr/{bin,share/{applications,metainfo,icons/hicolor/256x256/apps}}
+          cp dist/xdg/*.desktop staging/usr/share/applications/ 2>/dev/null || true
+          cp dist/xdg/*.png staging/usr/share/icons/hicolor/256x256/apps/ 2>/dev/null || true
+          cp dist/xdg/*.xml staging/usr/share/metainfo/ 2>/dev/null || true
+
+      - name: Configure & compile
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build
+
+      - name: Install to staging directory
+        run: DESTDIR=${{ github.workspace }}/staging cmake --install build
+
+      - name: Detect .deb runtime dependencies via dpkg-shlibdeps
+        id: shlibdeps
+        run: |
+          dpkg-shlibdeps -O staging/usr/bin/quran-companion > shlibdeps.raw 2>shlibdeps.log || true
+          cat shlibdeps.log
+          DEPS=$(sed -n 's/^shlibs:Depends=//p' shlibdeps.raw | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+          {
+            echo "deps<<EOF"
+            echo "$DEPS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build .deb package
+        run: |
+          DEPEND_ARGS=(--depends ffmpeg)
+          while IFS= read -r dep; do
+            [ -n "$dep" ] && DEPEND_ARGS+=(--depends "$dep")
+          done <<< "${{ steps.shlibdeps.outputs.deps }}"
+
+          fpm -s dir -t deb \
+            -C staging \
+            -n quran-companion \
+            -v "${{ env.APP_VER }}" \
+            -a "${{ matrix.arch }}" \
+            --maintainer "Foo Bar <someone@example.com>" \
+            --description "Native Qt6 build of Quran-Companion for ${{ matrix.arch }}" \
+            --category utils \
+            --deb-priority optional \
+            "${DEPEND_ARGS[@]}" \
+            usr/=/usr/
+      
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-installer-${{ matrix.arch }}
+          path: "quran-companion_${{ env.APP_VER }}_${{ matrix.arch }}.deb"
+          retention-days: 7
+      
