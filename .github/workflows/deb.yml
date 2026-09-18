@@ -72,9 +72,10 @@ jobs:
           - arch: amd64
             runner: ubuntu-24.04
             qc_arch: linux_gcc_64
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            qc_arch: linux_gcc_arm64
+          #issues with arm, fauks ib "Install Qt step, will have to look into jurplel install actions
+          #- arch: arm64
+          #  runner: ubuntu-24.04-arm
+          #  qc_arch: linux_gcc_arm64
 
     runs-on: ${{ matrix.runner }}
     env:
